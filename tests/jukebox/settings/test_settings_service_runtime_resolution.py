@@ -10,7 +10,7 @@ from jukebox.settings.resolve import SettingsService, build_environment_settings
 from tests.jukebox.settings._helpers import lookup_json_value
 
 
-def test_settings_service_rejects_sonos_runtime_without_active_target(tmp_path):
+def test_settings_service_allows_sonos_runtime_without_active_target_for_autodiscovery(tmp_path):
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(
         json.dumps({"schema_version": 1, "jukebox": {"player": {"type": "sonos"}}}),
@@ -18,8 +18,12 @@ def test_settings_service_rejects_sonos_runtime_without_active_target(tmp_path):
     )
     service = SettingsService(repository=FileSettingsRepository(str(settings_path)))
 
-    with pytest.raises(InvalidSettingsError, match="sonos player requires a resolved host, name, or group target"):
-        service.resolve_jukebox_runtime()
+    runtime_config = service.resolve_jukebox_runtime()
+
+    assert runtime_config.player_type == "sonos"
+    assert runtime_config.sonos_host is None
+    assert runtime_config.sonos_name is None
+    assert runtime_config.sonos_group is None
 
 
 def test_settings_service_allows_admin_runtime_resolution_without_sonos_target(tmp_path):

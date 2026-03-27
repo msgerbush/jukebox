@@ -22,7 +22,7 @@ def test_validate_resolved_jukebox_runtime_rules_allows_dryrun_without_sonos_tar
     validate_resolved_jukebox_runtime_rules(provider)
 
 
-def test_validate_resolved_jukebox_runtime_rules_rejects_missing_sonos_target():
+def test_validate_resolved_jukebox_runtime_rules_allows_missing_sonos_target_for_autodiscovery():
     provider = ObjectLeafValueProvider(
         SimpleNamespace(
             player_type="sonos",
@@ -34,8 +34,7 @@ def test_validate_resolved_jukebox_runtime_rules_rejects_missing_sonos_target():
         )
     )
 
-    with pytest.raises(ValueError, match="resolved host, name, or group target"):
-        validate_resolved_jukebox_runtime_rules(provider)
+    validate_resolved_jukebox_runtime_rules(provider)
 
 
 def test_validate_resolved_jukebox_runtime_rules_rejects_group_host_mismatch():

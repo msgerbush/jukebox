@@ -10,19 +10,6 @@ def validate_resolved_jukebox_runtime_rules(provider: SettingsValueProvider) -> 
             rule.validate(provider)
 
 
-def validate_sonos_target_presence(
-    player_type: str,
-    sonos_host,
-    sonos_name,
-    sonos_group,
-) -> None:
-    if player_type != "sonos":
-        return
-
-    if sonos_host is None and sonos_name is None and sonos_group is None:
-        raise ValueError("sonos player requires a resolved host, name, or group target")
-
-
 def validate_sonos_group_runtime_consistency(
     player_type: str,
     sonos_host,
@@ -40,16 +27,6 @@ def validate_sonos_group_runtime_consistency(
 
 
 RUNTIME_VALIDATION_RULES = (
-    SettingsValidationRule(
-        name="sonos_target_presence",
-        depends_on_paths=(
-            "runtime.player_type",
-            "runtime.sonos_host",
-            "runtime.sonos_name",
-            "runtime.sonos_group",
-        ),
-        validator=validate_sonos_target_presence,
-    ),
     SettingsValidationRule(
         name="sonos_group_runtime_consistency",
         depends_on_paths=(
