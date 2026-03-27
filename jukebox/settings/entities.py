@@ -187,8 +187,6 @@ class ResolvedJukeboxRuntimeConfig(StrictModel):
     @model_validator(mode="after")
     def validate_timing_relationships(self):
         validate_settings_rules(ObjectLeafValueProvider(self))
-        if self.player_type == "sonos" and self.sonos_host is None and self.sonos_name is None:
-            raise ValueError("player_type 'sonos' requires a valid active Sonos target")
         return self
 
 
