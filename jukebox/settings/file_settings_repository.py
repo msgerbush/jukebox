@@ -104,7 +104,7 @@ def _build_sparse_diff(current: JsonValue, default: object) -> Union[JsonValue, 
 
 def build_sparse_settings_payload(settings: AppSettings) -> JsonObject:
     default_data = cast(JsonObject, AppSettings().model_dump(mode="python"))
-    current_data = cast(JsonObject, settings.model_dump(mode="python"))
+    current_data = cast(JsonObject, settings.model_dump(mode="python", exclude_none=True))
     sparse_data = _build_sparse_diff(current_data, default_data)
     sparse_payload: JsonObject = cast(JsonObject, sparse_data) if isinstance(sparse_data, dict) else {}
     sparse_payload["schema_version"] = settings.schema_version
