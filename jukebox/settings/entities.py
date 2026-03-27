@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from jukebox.shared.timing import MIN_PAUSE_DELAY_SECONDS
 
-from .validation_rules import validate_settings_rules
+from .runtime_validation import validate_resolved_jukebox_runtime_rules
 from .value_providers import ObjectLeafValueProvider
 
 
@@ -172,11 +172,40 @@ class SparseAppSettings(StrictModel):
     admin: Optional[SparseAdminSettings] = None
 
 
+class ResolvedSonosSpeakerRuntime(StrictModel):
+    uid: str
+    name: str
+    host: str
+    household_id: str
+
+
+class ResolvedSonosGroupRuntime(StrictModel):
+    household_id: str
+    coordinator: ResolvedSonosSpeakerRuntime
+    members: list[ResolvedSonosSpeakerRuntime]
+
+    @model_validator(mode="after")
+    def validate_group_shape(self):
+        if not self.members:
+            raise ValueError("resolved Sonos group must include at least one member")
+
+        member_uids = {member.uid for member in self.members}
+        if self.coordinator.uid not in member_uids:
+            raise ValueError("resolved Sonos group coordinator must be present in members")
+
+        household_ids = {member.household_id for member in self.members}
+        if household_ids != {self.household_id}:
+            raise ValueError("resolved Sonos group members must belong to the same household")
+
+        return self
+
+
 class ResolvedJukeboxRuntimeConfig(StrictModel):
     library_path: str
     player_type: Literal["dryrun", "sonos"]
     sonos_host: Optional[str] = None
     sonos_name: Optional[str] = None
+    sonos_group: Optional[ResolvedSonosGroupRuntime] = None
     reader_type: Literal["dryrun", "nfc"]
     pause_duration_seconds: int
     pause_delay_seconds: float
@@ -185,8 +214,8 @@ class ResolvedJukeboxRuntimeConfig(StrictModel):
     verbose: bool = False
 
     @model_validator(mode="after")
-    def validate_timing_relationships(self):
-        validate_settings_rules(ObjectLeafValueProvider(self))
+    def validate_runtime_rules(self):
+        validate_resolved_jukebox_runtime_rules(ObjectLeafValueProvider(self))
         return self
 
 

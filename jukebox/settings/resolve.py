@@ -25,6 +25,7 @@ from .runtime_builders import (
     build_resolved_jukebox_runtime_config,
     expand_path,
 )
+from .sonos_runtime import SonosGroupResolver
 from .types import JsonObject, JsonValue
 from .validation_rules import validate_settings_rules
 from .value_providers import NestedMappingValueProvider
@@ -66,10 +67,12 @@ class SettingsService:
         repository: SettingsRepository,
         env_overrides: Optional[JsonObject] = None,
         cli_overrides: Optional[JsonObject] = None,
+        sonos_group_resolver: Optional[SonosGroupResolver] = None,
     ):
         self.repository = repository
         self.env_overrides = copy.deepcopy(env_overrides or {})
         self.cli_overrides = copy.deepcopy(cli_overrides or {})
+        self.sonos_group_resolver = sonos_group_resolver
 
     def get_persisted_settings_view(self) -> JsonObject:
         return self.repository.load_persisted_settings_data()
@@ -99,10 +102,17 @@ class SettingsService:
     def resolve_jukebox_runtime(self, verbose: bool = False) -> ResolvedJukeboxRuntimeConfig:
         effective_settings = self._resolve_effective_settings()
         try:
+            sonos_host, sonos_name, sonos_group = self._resolve_active_sonos_target(effective_settings)
             # Runtime-only invariants belong on the resolved runtime config so
             # admin/settings inspection can still work with incomplete jukebox settings.
-            return build_resolved_jukebox_runtime_config(effective_settings, verbose=verbose)
-        except ValidationError as err:
+            return build_resolved_jukebox_runtime_config(
+                effective_settings,
+                verbose=verbose,
+                sonos_host=sonos_host,
+                sonos_name=sonos_name,
+                sonos_group=sonos_group,
+            )
+        except (ValidationError, ValueError) as err:
             raise InvalidSettingsError(
                 _format_invalid_settings_message(str(err), self.env_overrides, self.cli_overrides)
             ) from err
@@ -217,6 +227,34 @@ class SettingsService:
                 "Settings saved. Changes take effect after restart." if restart_required_paths else "Settings saved."
             ),
         }
+
+    def _resolve_active_sonos_target(self, effective_settings: AppSettings):
+        player_settings = effective_settings.jukebox.player
+        if player_settings.type != "sonos":
+            return None, None, None
+
+        if player_settings.sonos.selected_group is not None:
+            resolved_group = self._get_sonos_group_resolver().resolve_selected_group(
+                player_settings.sonos.selected_group
+            )
+            return resolved_group.coordinator.host, None, resolved_group
+
+        if player_settings.sonos.manual_host is not None:
+            return player_settings.sonos.manual_host, None, None
+
+        if player_settings.sonos.manual_name is not None:
+            return None, player_settings.sonos.manual_name, None
+
+        return None, None, None
+
+    def _get_sonos_group_resolver(self) -> SonosGroupResolver:
+        if self.sonos_group_resolver is not None:
+            return self.sonos_group_resolver
+
+        from .sonos_runtime import SoCoSonosGroupResolver
+
+        self.sonos_group_resolver = SoCoSonosGroupResolver()
+        return self.sonos_group_resolver
 
 
 def _format_invalid_settings_message(error: str, env_overrides: JsonObject, cli_overrides: JsonObject) -> str:
