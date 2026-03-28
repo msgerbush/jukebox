@@ -38,12 +38,24 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class CheckFailure:
+    command: Tuple[str, ...]
+    returncode: int
+    stdout: str
+    stderr: str
+
+    def fingerprint(self) -> str:
+        return "|".join((quote_command(self.command), str(self.returncode), self.stdout.strip(), self.stderr.strip()))
+
+
+@dataclass(frozen=True)
 class RalphConfig:
     feature_prompt: str
     workdir: Path
     codex_bin: str
     model: Optional[str]
     max_rounds: int
+    max_check_repair_rounds: int
     base_ref: Optional[str]
     push_remote: str
     push_enabled: bool
@@ -86,6 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of review/fix rounds after the initial implementation.",
     )
     parser.add_argument(
+        "--max-check-repair-rounds",
+        type=int,
+        default=1,
+        help="Maximum Codex retry rounds for failed repository checks within each phase.",
+    )
+    parser.add_argument(
         "--base-ref",
         help="Existing git ref to review against. If omitted, Ralph pins the current HEAD as a local base branch.",
     )
@@ -120,6 +138,8 @@ def parse_args(argv: Sequence[str]) -> RalphConfig:
 
     if args.max_rounds < 1:
         parser.error("--max-rounds must be at least 1.")
+    if args.max_check_repair_rounds < 0:
+        parser.error("--max-check-repair-rounds must be zero or greater.")
 
     return RalphConfig(
         feature_prompt=feature_prompt,
@@ -127,6 +147,7 @@ def parse_args(argv: Sequence[str]) -> RalphConfig:
         codex_bin=args.codex_bin,
         model=args.model,
         max_rounds=args.max_rounds,
+        max_check_repair_rounds=args.max_check_repair_rounds,
         base_ref=args.base_ref,
         push_remote=args.push_remote,
         push_enabled=not args.no_push,
@@ -279,6 +300,24 @@ def fix_prompt(findings_path: Path) -> str:
     ).strip()
 
 
+def check_repair_prompt(check_failures_path: Path, task_context: str) -> str:
+    return textwrap.dedent(
+        f"""\
+        Repository checks are failing after this task:
+        {task_context}
+
+        Read the failing check transcript at {check_failures_path} and make the minimum code changes
+        needed to get the repository checks passing.
+
+        Constraints:
+        - Only address issues needed for the failing checks.
+        - Keep unrelated code unchanged.
+        - Do not commit changes.
+        - Do not push changes.
+        """
+    ).strip()
+
+
 def commit_message_prompt() -> str:
     return textwrap.dedent(
         """\
@@ -320,9 +359,81 @@ def findings_signature(findings: Sequence[Finding]) -> Tuple[str, ...]:
     return tuple(sorted(finding.fingerprint() for finding in findings))
 
 
-def run_checks(cwd: Path) -> None:
+def emit_captured_output(completed: subprocess.CompletedProcess[str]) -> None:
+    if completed.stdout:
+        print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
+    if completed.stderr:
+        print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n", file=sys.stderr)
+
+
+def run_checks_once(cwd: Path) -> List[CheckFailure]:
+    failures: List[CheckFailure] = []
     for command in DEFAULT_CHECK_COMMANDS:
-        run_command(command, cwd)
+        completed = run_command(command, cwd, capture_output=True, check=False)
+        emit_captured_output(completed)
+        if completed.returncode != 0:
+            failures.append(
+                CheckFailure(
+                    command=tuple(command),
+                    returncode=completed.returncode,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                )
+            )
+    return failures
+
+
+def format_check_failures(failures: Sequence[CheckFailure]) -> str:
+    sections = []
+    for failure in failures:
+        section = [
+            f"Command: {quote_command(failure.command)}",
+            f"Exit code: {failure.returncode}",
+        ]
+        stdout = failure.stdout.strip()
+        stderr = failure.stderr.strip()
+        if stdout:
+            section.extend(("stdout:", stdout))
+        if stderr:
+            section.extend(("stderr:", stderr))
+        sections.append("\n".join(section))
+    return "\n\n".join(sections)
+
+
+def check_failures_signature(failures: Sequence[CheckFailure]) -> Tuple[str, ...]:
+    return tuple(sorted(failure.fingerprint() for failure in failures))
+
+
+def write_check_failures(path: Path, failures: Sequence[CheckFailure]) -> None:
+    path.write_text(format_check_failures(failures), encoding="utf-8")
+
+
+def run_check_repair_pass(config: RalphConfig, check_failures_path: Path, task_context: str) -> None:
+    command = codex_base_command(config)
+    command.append(check_repair_prompt(check_failures_path, task_context))
+    run_command(command, config.workdir)
+
+
+def run_checks_with_auto_repair(config: RalphConfig, scratch: Path, phase_name: str, task_context: str) -> None:
+    previous_signature: Optional[Tuple[str, ...]] = None
+    for attempt_number in range(0, config.max_check_repair_rounds + 1):
+        failures = run_checks_once(config.workdir)
+        if not failures:
+            return
+
+        signature = check_failures_signature(failures)
+        if signature == previous_signature:
+            raise RalphError(f"Check failures repeated during {phase_name}; stopping to avoid an endless loop.")
+        previous_signature = signature
+
+        if attempt_number >= config.max_check_repair_rounds:
+            raise RalphError(
+                f"Repository checks failed during {phase_name} after {attempt_number} auto-repair attempt(s)."
+            )
+
+        failures_path = scratch / f"{phase_name}-check-failures-{attempt_number + 1}.txt"
+        write_check_failures(failures_path, failures)
+        run_check_repair_pass(config, failures_path, task_context)
 
 
 def stage_all_changes(cwd: Path) -> None:
@@ -399,7 +510,12 @@ def main(argv: Sequence[str]) -> int:
     print(f"Using review base: {base_ref}")
 
     run_initial_implementation(config)
-    run_checks(config.workdir)
+    run_checks_with_auto_repair(
+        config,
+        scratch,
+        phase_name="implementation",
+        task_context="Implement the requested feature and leave the repository checks passing.",
+    )
     first_commit_message = commit_with_generated_message(config, scratch)
     print(f"Committed implementation: {first_commit_message}")
 
@@ -424,7 +540,12 @@ def main(argv: Sequence[str]) -> int:
 
         print(f"Review round {round_number}: {len(findings)} actionable finding(s)")
         run_fix_pass(config, review_path)
-        run_checks(config.workdir)
+        run_checks_with_auto_repair(
+            config,
+            scratch,
+            phase_name=f"review-round-{round_number}",
+            task_context=f"Fix the review findings listed in {review_path} and leave the repository checks passing.",
+        )
         commit_message = commit_with_generated_message(config, scratch)
         print(f"Committed review fixes: {commit_message}")
 
