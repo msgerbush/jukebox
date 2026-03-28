@@ -169,6 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: Sequence[str]) -> RalphConfig:
     parser = build_parser()
     args = parser.parse_args(argv)
+    workdir = args.workdir.resolve()
 
     feature_prompt = resolve_feature_prompt(
         feature_prompt=args.feature_prompt,
@@ -182,9 +183,12 @@ def parse_args(argv: Sequence[str]) -> RalphConfig:
     if args.max_check_repair_rounds < 0:
         parser.error("--max-check-repair-rounds must be zero or greater.")
 
+    review_schema_path = resolve_optional_path(args.review_schema, workdir)
+    assert review_schema_path is not None
+
     return RalphConfig(
         feature_prompt=feature_prompt,
-        workdir=args.workdir.resolve(),
+        workdir=workdir,
         codex_bin=args.codex_bin,
         model=args.model,
         max_rounds=args.max_rounds,
@@ -192,8 +196,8 @@ def parse_args(argv: Sequence[str]) -> RalphConfig:
         base_ref=args.base_ref,
         push_remote=args.push_remote,
         push_enabled=not args.no_push,
-        review_schema_path=resolve_optional_path(args.review_schema, args.workdir.resolve()),
-        scratch_dir=resolve_optional_path(args.scratch_dir, args.workdir.resolve()),
+        review_schema_path=review_schema_path,
+        scratch_dir=resolve_optional_path(args.scratch_dir, workdir),
         scratch_dir_name=args.scratch_dir_name,
     )
 
@@ -375,6 +379,13 @@ def commit_message_prompt() -> str:
     ).strip()
 
 
+def read_text_output(path: Path) -> Optional[str]:
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8").strip()
+    return text or None
+
+
 def require_mapping(value: object, context: str) -> dict:
     if not isinstance(value, dict):
         raise RalphError(f"Review output field {context} must be a JSON object.")
@@ -472,6 +483,57 @@ def findings_signature(findings: Sequence[Finding]) -> Tuple[str, ...]:
     return tuple(sorted(finding.fingerprint() for finding in findings))
 
 
+def parse_jsonl_events(stream_text: str) -> Tuple[dict, ...]:
+    events: List[dict] = []
+    for line_number, raw_line in enumerate(stream_text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RalphError(f"Codex JSON mode emitted invalid JSON on line {line_number}: {error}") from error
+        if not isinstance(payload, dict):
+            raise RalphError(f"Codex JSON mode event on line {line_number} must be a JSON object.")
+        events.append(payload)
+    if not events:
+        raise RalphError("Codex JSON mode produced no events.")
+    return tuple(events)
+
+
+def json_mode_text(value: object, context: str) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        return json.dumps(value)
+    raise RalphError(f"Codex JSON mode field {context} must be a string or JSON object.")
+
+
+def recover_review_text_from_jsonl(stream_text: str) -> str:
+    events = parse_jsonl_events(stream_text)
+    for event in reversed(events):
+        review_text = json_mode_text(event.get("review_output"), "review_output")
+        if review_text:
+            return review_text
+    for event in reversed(events):
+        final_message = json_mode_text(event.get("last_agent_message"), "last_agent_message")
+        if final_message:
+            return final_message
+    raise RalphError("Codex JSON mode did not include a final review result.")
+
+
+def recover_commit_message_from_jsonl(stream_text: str) -> str:
+    events = parse_jsonl_events(stream_text)
+    for event in reversed(events):
+        final_message = json_mode_text(event.get("last_agent_message"), "last_agent_message")
+        if final_message:
+            return final_message
+    raise RalphError("Codex JSON mode did not include a final commit message.")
+
+
 def emit_captured_output(completed: subprocess.CompletedProcess[str]) -> None:
     if completed.stdout:
         print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
@@ -479,11 +541,12 @@ def emit_captured_output(completed: subprocess.CompletedProcess[str]) -> None:
         print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n", file=sys.stderr)
 
 
-def run_checks_once(cwd: Path) -> List[CheckFailure]:
+def run_checks_once(cwd: Path, *, emit_output: bool = True) -> List[CheckFailure]:
     failures: List[CheckFailure] = []
     for command in DEFAULT_CHECK_COMMANDS:
         completed = run_command(command, cwd, capture_output=True, check=False)
-        emit_captured_output(completed)
+        if emit_output:
+            emit_captured_output(completed)
         if completed.returncode != 0:
             failures.append(
                 CheckFailure(
@@ -517,8 +580,34 @@ def check_failures_signature(failures: Sequence[CheckFailure]) -> Tuple[str, ...
     return tuple(sorted(failure.fingerprint() for failure in failures))
 
 
+def baseline_failure_signatures(failures: Sequence[CheckFailure]) -> Tuple[str, ...]:
+    return check_failures_signature(failures)
+
+
+def introduced_check_failures(
+    failures: Sequence[CheckFailure], baseline_signatures: Sequence[str]
+) -> Tuple[CheckFailure, ...]:
+    baseline = set(baseline_signatures)
+    return tuple(failure for failure in failures if failure.fingerprint() not in baseline)
+
+
 def write_check_failures(path: Path, failures: Sequence[CheckFailure]) -> None:
     path.write_text(format_check_failures(failures), encoding="utf-8")
+
+
+def run_codex_json_capture(config: RalphConfig, prompt: str, *, output_schema_path: Optional[Path] = None) -> str:
+    command = codex_base_command(config)
+    if output_schema_path is not None:
+        command.extend(("--output-schema", str(output_schema_path)))
+    command.extend(("--json", prompt))
+
+    completed = run_command(command, config.workdir, capture_output=True, check=False)
+    if completed.returncode != 0:
+        emit_captured_output(completed)
+        raise RalphError(f"Command failed ({completed.returncode}): {quote_command(command)}")
+    if completed.stderr:
+        print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n", file=sys.stderr)
+    return completed.stdout
 
 
 def run_check_repair_pass(config: RalphConfig, check_failures_path: Path, task_context: str) -> None:
@@ -527,14 +616,25 @@ def run_check_repair_pass(config: RalphConfig, check_failures_path: Path, task_c
     run_command(command, config.workdir)
 
 
-def run_checks_with_auto_repair(config: RalphConfig, scratch: Path, phase_name: str, task_context: str) -> None:
+def run_checks_with_auto_repair(
+    config: RalphConfig,
+    scratch: Path,
+    phase_name: str,
+    task_context: str,
+    baseline_signatures: Sequence[str],
+) -> None:
     previous_signature: Optional[Tuple[str, ...]] = None
     for attempt_number in range(0, config.max_check_repair_rounds + 1):
         failures = run_checks_once(config.workdir)
         if not failures:
             return
 
-        signature = check_failures_signature(failures)
+        introduced_failures = introduced_check_failures(failures, baseline_signatures)
+        if not introduced_failures:
+            print(f"Ignoring {len(failures)} baseline check failure(s) during {phase_name}.")
+            return
+
+        signature = check_failures_signature(introduced_failures)
         if signature == previous_signature:
             raise RalphError(f"Check failures repeated during {phase_name}; stopping to avoid an endless loop.")
         previous_signature = signature
@@ -545,7 +645,7 @@ def run_checks_with_auto_repair(config: RalphConfig, scratch: Path, phase_name: 
             )
 
         failures_path = scratch / f"{phase_name}-check-failures-{attempt_number + 1}.txt"
-        write_check_failures(failures_path, failures)
+        write_check_failures(failures_path, introduced_failures)
         run_check_repair_pass(config, failures_path, task_context)
 
 
@@ -577,7 +677,11 @@ def commit_with_generated_message(config: RalphConfig, scratch: Path) -> str:
     command.extend(("-o", str(message_path), commit_message_prompt()))
     run_command(command, config.workdir)
 
-    message = message_path.read_text(encoding="utf-8").strip()
+    message = read_text_output(message_path)
+    if message is None:
+        json_output = run_codex_json_capture(config, commit_message_prompt())
+        message = recover_commit_message_from_jsonl(json_output)
+        message_path.write_text(f"{message}\n", encoding="utf-8")
     if not message:
         raise RalphError("Codex did not produce a commit message.")
 
@@ -603,7 +707,15 @@ def run_review(config: RalphConfig, review_base: ReviewBase, review_path: Path) 
         )
     )
     run_command(command, config.workdir)
-    return parse_review_result(review_path.read_text(encoding="utf-8"))
+
+    review_text = read_text_output(review_path)
+    if review_text is None:
+        json_output = run_codex_json_capture(
+            config, review_prompt(review_base), output_schema_path=config.review_schema_path
+        )
+        review_text = recover_review_text_from_jsonl(json_output)
+        review_path.write_text(f"{review_text}\n", encoding="utf-8")
+    return parse_review_result(review_text)
 
 
 def run_fix_pass(config: RalphConfig, findings_path: Path) -> None:
@@ -634,12 +746,20 @@ def main(argv: Sequence[str]) -> int:
     print(f"Using review diff base SHA: {review_base.diff_base_sha}")
     print(f"Using scratch directory: {scratch}")
 
+    baseline_failures = run_checks_once(config.workdir, emit_output=False)
+    baseline_signatures = baseline_failure_signatures(baseline_failures)
+    if baseline_failures:
+        print(
+            f"Detected {len(baseline_failures)} pre-existing check failure(s); Ralph will ignore them unless they change."
+        )
+
     run_initial_implementation(config)
     run_checks_with_auto_repair(
         config,
         scratch,
         phase_name="implementation",
         task_context="Implement the requested feature and leave the repository checks passing.",
+        baseline_signatures=baseline_signatures,
     )
     first_commit_message = commit_with_generated_message(config, scratch)
     print(f"Committed implementation: {first_commit_message}")
@@ -670,6 +790,7 @@ def main(argv: Sequence[str]) -> int:
             scratch,
             phase_name=f"review-round-{round_number}",
             task_context=f"Fix the review findings listed in {review_path} and leave the repository checks passing.",
+            baseline_signatures=baseline_signatures,
         )
         commit_message = commit_with_generated_message(config, scratch)
         print(f"Committed review fixes: {commit_message}")
