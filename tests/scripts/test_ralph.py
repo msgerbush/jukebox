@@ -88,6 +88,33 @@ def test_parse_review_result_rejects_inconsistent_overall_correctness():
         )
 
 
+def test_parse_review_result_rejects_findings_marked_correct():
+    ralph = load_ralph_module()
+
+    with pytest.raises(ralph.RalphError, match="reported findings"):
+        ralph.parse_review_result(
+            """
+            {
+              "findings": [
+                {
+                  "title": "[P2] Keep overall_correctness consistent",
+                  "body": "A finding means the patch is not correct yet.",
+                  "confidence_score": 0.7,
+                  "priority": 2,
+                  "code_location": {
+                    "absolute_file_path": "/tmp/project/scripts/ralph.py",
+                    "line_range": {"start": 1, "end": 2}
+                  }
+                }
+              ],
+              "overall_correctness": "patch is correct",
+              "overall_explanation": "This payload is inconsistent.",
+              "overall_confidence_score": 0.7
+            }
+            """
+        )
+
+
 def test_recover_review_text_from_jsonl_prefers_structured_review_output():
     ralph = load_ralph_module()
 
@@ -122,6 +149,18 @@ def test_select_jsonl_stream_accepts_stderr_when_stdout_is_not_json():
 
     stream_text, stream_name = ralph.select_jsonl_stream(
         "progress update\n",
+        '{"type":"task_complete","last_agent_message":"Recovered from stderr"}\n',
+    )
+
+    assert stream_name == "stderr"
+    assert stream_text == '{"type":"task_complete","last_agent_message":"Recovered from stderr"}\n'
+
+
+def test_select_jsonl_stream_prefers_terminal_payload_over_partial_stdout():
+    ralph = load_ralph_module()
+
+    stream_text, stream_name = ralph.select_jsonl_stream(
+        '{"type":"agent_message","message":"still working"}\n',
         '{"type":"task_complete","last_agent_message":"Recovered from stderr"}\n',
     )
 
@@ -320,6 +359,51 @@ def test_run_checks_with_auto_repair_rejects_repeated_failures(tmp_path, monkeyp
     )
 
     attempts = iter([[failure], [failure]])
+    monkeypatch.setattr(ralph, "run_checks_once", lambda cwd, emit_output=True: next(attempts))
+    monkeypatch.setattr(ralph, "run_check_repair_pass", lambda *args: None)
+
+    with pytest.raises(ralph.RalphError, match="Check failures repeated"):
+        ralph.run_checks_with_auto_repair(
+            config,
+            scratch,
+            "implementation",
+            "task context",
+            baseline_signatures=(),
+        )
+
+
+def test_run_checks_with_auto_repair_rejects_non_consecutive_repeated_failures(tmp_path, monkeypatch):
+    ralph = load_ralph_module()
+    config = ralph.RalphConfig(
+        feature_prompt="feature",
+        workdir=tmp_path,
+        codex_bin="codex",
+        model=None,
+        max_rounds=3,
+        max_check_repair_rounds=3,
+        base_ref=None,
+        push_remote="origin",
+        push_enabled=False,
+        review_schema_path=tmp_path / "schema.json",
+        scratch_dir=None,
+        scratch_dir_name="ralph",
+    )
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    failure_a = ralph.CheckFailure(
+        command=("uv", "run", "pytest"),
+        returncode=1,
+        stdout="failure a",
+        stderr="",
+    )
+    failure_b = ralph.CheckFailure(
+        command=("uv", "run", "ruff", "check"),
+        returncode=1,
+        stdout="failure b",
+        stderr="",
+    )
+
+    attempts = iter([[failure_a], [failure_b], [failure_a]])
     monkeypatch.setattr(ralph, "run_checks_once", lambda cwd, emit_output=True: next(attempts))
     monkeypatch.setattr(ralph, "run_check_repair_pass", lambda *args: None)
 
@@ -540,3 +624,70 @@ def test_run_codex_json_capture_prefers_valid_stderr_json_stream(monkeypatch, tm
     captured = capsys.readouterr()
     assert "captured progress" in captured.out
     assert captured.err == ""
+
+
+def test_main_rejects_non_consecutive_repeated_review_findings(tmp_path, monkeypatch):
+    ralph = load_ralph_module()
+    config = ralph.RalphConfig(
+        feature_prompt="feature",
+        workdir=tmp_path,
+        codex_bin="codex",
+        model=None,
+        max_rounds=3,
+        max_check_repair_rounds=1,
+        base_ref="feature/phase7.3-cli-ux-cleanup",
+        push_remote="origin",
+        push_enabled=False,
+        review_schema_path=tmp_path / "schema.json",
+        scratch_dir=tmp_path / "scratch",
+        scratch_dir_name="ralph",
+    )
+    config.review_schema_path.write_text("{}", encoding="utf-8")
+    config.scratch_dir.mkdir()
+
+    finding_a = ralph.Finding(
+        title="[P1] First loop bug",
+        body="Round one finding.",
+        file_path="/tmp/project/scripts/ralph.py",
+        start_line=10,
+        end_line=11,
+        priority=1,
+        confidence_score=0.8,
+    )
+    finding_b = ralph.Finding(
+        title="[P2] Second loop bug",
+        body="Round two finding.",
+        file_path="/tmp/project/scripts/ralph.py",
+        start_line=20,
+        end_line=21,
+        priority=2,
+        confidence_score=0.7,
+    )
+    review_results = iter(
+        [
+            ralph.ReviewResult((finding_a,), ralph.REVIEW_INCORRECT, "first", 0.8),
+            ralph.ReviewResult((finding_b,), ralph.REVIEW_INCORRECT, "second", 0.7),
+            ralph.ReviewResult((finding_a,), ralph.REVIEW_INCORRECT, "third", 0.8),
+        ]
+    )
+
+    monkeypatch.setattr(ralph, "parse_args", lambda argv: config)
+    monkeypatch.setattr(ralph, "ensure_git_repo", lambda cwd: None)
+    monkeypatch.setattr(ralph, "git_status_porcelain", lambda cwd: "")
+    monkeypatch.setattr(ralph, "current_branch", lambda cwd: "codex/ralph-script")
+    monkeypatch.setattr(
+        ralph,
+        "ensure_review_base",
+        lambda cwd, requested_ref, branch: ralph.ReviewBase(requested_ref or branch, "deadbeef"),
+    )
+    monkeypatch.setattr(ralph, "create_scratch_dir", lambda current_config: config.scratch_dir)
+    monkeypatch.setattr(ralph, "run_checks_once", lambda cwd, emit_output=False: [])
+    monkeypatch.setattr(ralph, "run_initial_implementation", lambda current_config: None)
+    monkeypatch.setattr(ralph, "run_checks_with_auto_repair", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ralph, "commit_with_generated_message", lambda current_config, scratch: "msg")
+    monkeypatch.setattr(ralph, "run_review", lambda current_config, review_base, review_path: next(review_results))
+    monkeypatch.setattr(ralph, "run_fix_pass", lambda current_config, findings_path: None)
+    monkeypatch.setattr(ralph, "push_branch", lambda cwd, remote, branch: None)
+
+    with pytest.raises(ralph.RalphError, match="Review findings repeated in round 3"):
+        ralph.main([])

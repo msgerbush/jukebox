@@ -12,7 +12,7 @@ import tempfile
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 DEFAULT_CHECK_COMMANDS: Tuple[Tuple[str, ...], ...] = (
     ("uv", "run", "ruff", "format", "--check"),
@@ -470,6 +470,8 @@ def parse_review_result(review_text: str) -> ReviewResult:
 
     if not findings and overall_correctness != REVIEW_CORRECT:
         raise RalphError("Review output reported no findings but did not mark the patch as correct.")
+    if findings and overall_correctness != REVIEW_INCORRECT:
+        raise RalphError("Review output reported findings but still marked the patch as correct.")
 
     return ReviewResult(
         findings=tuple(findings),
@@ -503,21 +505,39 @@ def parse_jsonl_events(stream_text: str) -> Tuple[dict, ...]:
     return tuple(events)
 
 
+def jsonl_stream_payload_score(events: Sequence[dict]) -> int:
+    score = 0
+    for event in events:
+        if json_mode_text(event.get("last_agent_message"), "last_agent_message"):
+            score = max(score, 1)
+        if json_mode_text(event.get("review_output"), "review_output"):
+            score = max(score, 2)
+    return score
+
+
 def select_jsonl_stream(stdout: str, stderr: str) -> Tuple[str, str]:
     candidates = (
         ("stdout", stdout),
         ("stderr", stderr),
     )
     errors = []
+    best_candidate: Optional[Tuple[str, str]] = None
+    best_score = -1
     for stream_name, stream_text in candidates:
         if not stream_text.strip():
             continue
         try:
-            parse_jsonl_events(stream_text)
+            events = parse_jsonl_events(stream_text)
+            score = jsonl_stream_payload_score(events)
         except RalphError as error:
             errors.append(f"{stream_name}: {error}")
             continue
-        return stream_text, stream_name
+        if score > best_score:
+            best_candidate = (stream_text, stream_name)
+            best_score = score
+
+    if best_candidate is not None:
+        return best_candidate
 
     if not errors:
         raise RalphError("Codex JSON mode produced no events.")
@@ -650,7 +670,7 @@ def run_checks_with_auto_repair(
     task_context: str,
     baseline_signatures: Sequence[str],
 ) -> None:
-    previous_signature: Optional[Tuple[str, ...]] = None
+    seen_signatures: Set[Tuple[str, ...]] = set()
     for attempt_number in range(0, config.max_check_repair_rounds + 1):
         failures = run_checks_once(config.workdir)
         if not failures:
@@ -662,9 +682,9 @@ def run_checks_with_auto_repair(
             return
 
         signature = check_failures_signature(introduced_failures)
-        if signature == previous_signature:
+        if signature in seen_signatures:
             raise RalphError(f"Check failures repeated during {phase_name}; stopping to avoid an endless loop.")
-        previous_signature = signature
+        seen_signatures.add(signature)
 
         if attempt_number >= config.max_check_repair_rounds:
             raise RalphError(
@@ -801,7 +821,7 @@ def main(argv: Sequence[str]) -> int:
     first_commit_message = commit_with_generated_message(config, scratch)
     print(f"Committed implementation: {first_commit_message}")
 
-    previous_signature: Optional[Tuple[str, ...]] = None
+    seen_signatures: Set[Tuple[str, ...]] = set()
 
     for round_number in range(1, config.max_rounds + 1):
         review_path = scratch / f"review-round-{round_number}.json"
@@ -816,9 +836,9 @@ def main(argv: Sequence[str]) -> int:
             return 0
 
         signature = findings_signature(review_result.findings)
-        if signature == previous_signature:
+        if signature in seen_signatures:
             raise RalphError(f"Review findings repeated in round {round_number}; stopping to avoid an endless loop.")
-        previous_signature = signature
+        seen_signatures.add(signature)
 
         print(f"Review round {round_number}: {len(review_result.findings)} actionable finding(s)")
         run_fix_pass(config, review_path)
