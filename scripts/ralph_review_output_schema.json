@@ -18,21 +18,21 @@
                                 "type": "object",
                                 "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}},
                                 "required": ["start", "end"],
-                                "additionalProperties": false,
-                            },
+                                "additionalProperties": false
+                            }
                         },
                         "required": ["absolute_file_path", "line_range"],
-                        "additionalProperties": false,
-                    },
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["title", "body", "confidence_score", "priority", "code_location"],
-                "additionalProperties": false,
-            },
+                "additionalProperties": false
+            }
         },
         "overall_correctness": {"type": "string", "enum": ["patch is correct", "patch is incorrect"]},
         "overall_explanation": {"type": "string"},
-        "overall_confidence_score": {"type": ["number", "null"]},
+        "overall_confidence_score": {"type": ["number", "null"]}
     },
     "required": ["findings", "overall_correctness", "overall_explanation", "overall_confidence_score"],
-    "additionalProperties": false,
+    "additionalProperties": false
 }
