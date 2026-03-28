@@ -15,39 +15,99 @@ def load_ralph_module():
     return module
 
 
-def test_parse_review_output_accepts_no_findings():
+def test_parse_review_result_accepts_empty_findings_for_correct_patch():
     ralph = load_ralph_module()
 
-    assert ralph.parse_review_output("NO_FINDINGS\n") == []
-
-
-def test_parse_review_output_parses_canonical_findings():
-    ralph = load_ralph_module()
-
-    findings = ralph.parse_review_output(
-        "FINDING|P1|jukebox/app.py|Handle empty queue before play\n"
-        "FINDING|P3|tests/test_app.py|Add regression coverage\n"
+    result = ralph.parse_review_result(
+        """
+        {
+          "findings": [],
+          "overall_correctness": "patch is correct",
+          "overall_explanation": "No actionable bugs were identified.",
+          "overall_confidence_score": 0.82
+        }
+        """
     )
 
-    assert [finding.fingerprint() for finding in findings] == [
-        "P1|jukebox/app.py|Handle empty queue before play",
-        "P3|tests/test_app.py|Add regression coverage",
+    assert result.findings == ()
+    assert result.overall_correctness == "patch is correct"
+
+
+def test_parse_review_result_parses_structured_findings():
+    ralph = load_ralph_module()
+
+    result = ralph.parse_review_result(
+        """
+        {
+          "findings": [
+            {
+              "title": "[P1] Pin review base to a commit",
+              "body": "Using a moving ref can skip review on an empty diff.",
+              "confidence_score": 0.91,
+              "priority": 1,
+              "code_location": {
+                "absolute_file_path": "/tmp/project/scripts/ralph.py",
+                "line_range": {"start": 210, "end": 214}
+              }
+            }
+          ],
+          "overall_correctness": "patch is incorrect",
+          "overall_explanation": "The review loop can incorrectly terminate early.",
+          "overall_confidence_score": 0.91
+        }
+        """
+    )
+
+    assert [finding.fingerprint() for finding in result.findings] == [
+        "1|/tmp/project/scripts/ralph.py|210|214|[P1] Pin review base to a commit"
     ]
 
 
-def test_parse_review_output_rejects_free_form_text():
+def test_parse_review_result_rejects_empty_output():
     ralph = load_ralph_module()
 
-    with pytest.raises(ralph.RalphError):
-        ralph.parse_review_output("Looks good overall, but maybe add a test.")
+    with pytest.raises(ralph.RalphError, match="empty"):
+        ralph.parse_review_result(" \n ")
+
+
+def test_parse_review_result_rejects_inconsistent_overall_correctness():
+    ralph = load_ralph_module()
+
+    with pytest.raises(ralph.RalphError, match="no findings"):
+        ralph.parse_review_result(
+            """
+            {
+              "findings": [],
+              "overall_correctness": "patch is incorrect",
+              "overall_explanation": "Incorrect without findings.",
+              "overall_confidence_score": 0.4
+            }
+            """
+        )
 
 
 def test_findings_signature_is_order_independent():
     ralph = load_ralph_module()
 
     findings_a = [
-        ralph.Finding(priority="P2", file_path="a.py", summary="First"),
-        ralph.Finding(priority="P1", file_path="b.py", summary="Second"),
+        ralph.Finding(
+            title="[P2] First",
+            body="First body",
+            file_path="a.py",
+            start_line=10,
+            end_line=11,
+            priority=2,
+            confidence_score=0.5,
+        ),
+        ralph.Finding(
+            title="[P1] Second",
+            body="Second body",
+            file_path="b.py",
+            start_line=20,
+            end_line=21,
+            priority=1,
+            confidence_score=0.6,
+        ),
     ]
     findings_b = list(reversed(findings_a))
 
@@ -74,6 +134,54 @@ def test_format_check_failures_includes_command_and_outputs():
     assert "failing stderr" in rendered
 
 
+def test_create_scratch_dir_defaults_outside_worktree(tmp_path):
+    ralph = load_ralph_module()
+    config = ralph.RalphConfig(
+        feature_prompt="feature",
+        workdir=tmp_path,
+        codex_bin="codex",
+        model=None,
+        max_rounds=3,
+        max_check_repair_rounds=1,
+        base_ref=None,
+        push_remote="origin",
+        push_enabled=False,
+        review_schema_path=tmp_path / "schema.json",
+        scratch_dir=None,
+        scratch_dir_name="ralph-test",
+    )
+
+    scratch = ralph.create_scratch_dir(config)
+
+    assert scratch.exists()
+    assert not str(scratch).startswith(str(tmp_path / "ralph-test"))
+    assert tmp_path not in scratch.parents
+
+
+def test_ensure_review_base_pins_requested_ref(monkeypatch, tmp_path):
+    ralph = load_ralph_module()
+    command_calls = []
+
+    def fake_command_output(command, cwd):
+        command_calls.append(command)
+        if command == ("git", "rev-parse", "--verify", "main"):
+            return "abc123"
+        if command == ("git", "merge-base", "HEAD", "abc123"):
+            return "deadbeef"
+        raise AssertionError(f"Unexpected command: {command}")
+
+    monkeypatch.setattr(ralph, "command_output", fake_command_output)
+
+    review_base = ralph.ensure_review_base(tmp_path, "main", "feature-branch")
+
+    assert review_base.label == "main"
+    assert review_base.diff_base_sha == "deadbeef"
+    assert command_calls == [
+        ("git", "rev-parse", "--verify", "main"),
+        ("git", "merge-base", "HEAD", "abc123"),
+    ]
+
+
 def test_run_checks_with_auto_repair_retries_once(tmp_path, monkeypatch):
     ralph = load_ralph_module()
     config = ralph.RalphConfig(
@@ -86,9 +194,11 @@ def test_run_checks_with_auto_repair_retries_once(tmp_path, monkeypatch):
         base_ref=None,
         push_remote="origin",
         push_enabled=False,
-        scratch_dir_name=".ralph",
+        review_schema_path=tmp_path / "schema.json",
+        scratch_dir=None,
+        scratch_dir_name="ralph",
     )
-    scratch = tmp_path / ".ralph"
+    scratch = tmp_path / "scratch"
     scratch.mkdir()
 
     attempts = iter(
@@ -132,9 +242,11 @@ def test_run_checks_with_auto_repair_rejects_repeated_failures(tmp_path, monkeyp
         base_ref=None,
         push_remote="origin",
         push_enabled=False,
-        scratch_dir_name=".ralph",
+        review_schema_path=tmp_path / "schema.json",
+        scratch_dir=None,
+        scratch_dir_name="ralph",
     )
-    scratch = tmp_path / ".ralph"
+    scratch = tmp_path / "scratch"
     scratch.mkdir()
     failure = ralph.CheckFailure(
         command=("uv", "run", "pytest"),
