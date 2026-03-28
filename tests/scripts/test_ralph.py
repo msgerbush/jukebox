@@ -1,6 +1,7 @@
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from subprocess import CompletedProcess
 
 import pytest
 
@@ -114,6 +115,33 @@ def test_recover_commit_message_from_jsonl_uses_last_agent_message():
     )
 
     assert message == "Harden Ralph fallback handling\n\nRecover structured JSON output when files are empty."
+
+
+def test_select_jsonl_stream_accepts_stderr_when_stdout_is_not_json():
+    ralph = load_ralph_module()
+
+    stream_text, stream_name = ralph.select_jsonl_stream(
+        "progress update\n",
+        '{"type":"task_complete","last_agent_message":"Recovered from stderr"}\n',
+    )
+
+    assert stream_name == "stderr"
+    assert stream_text == '{"type":"task_complete","last_agent_message":"Recovered from stderr"}\n'
+
+
+def test_parse_jsonl_events_ignores_non_json_log_lines():
+    ralph = load_ralph_module()
+
+    events = ralph.parse_jsonl_events(
+        """
+        Reading prompt from stdin...
+        {"type":"agent_message","message":"working"}
+        streamed 1 event
+        {"type":"task_complete","last_agent_message":"done"}
+        """
+    )
+
+    assert [event["type"] for event in events] == ["agent_message", "task_complete"]
 
 
 def test_findings_signature_is_order_independent():
@@ -391,6 +419,49 @@ def test_run_review_falls_back_to_json_mode_when_output_file_is_empty(tmp_path, 
     assert "patch is correct" in review_path.read_text(encoding="utf-8")
 
 
+def test_run_review_falls_back_to_json_mode_when_output_file_is_invalid(tmp_path, monkeypatch, capsys):
+    ralph = load_ralph_module()
+    review_path = tmp_path / "review.json"
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    config = ralph.RalphConfig(
+        feature_prompt="feature",
+        workdir=tmp_path,
+        codex_bin="codex",
+        model=None,
+        max_rounds=3,
+        max_check_repair_rounds=1,
+        base_ref=None,
+        push_remote="origin",
+        push_enabled=False,
+        review_schema_path=schema_path,
+        scratch_dir=None,
+        scratch_dir_name="ralph",
+    )
+    review_base = ralph.ReviewBase(label="main", diff_base_sha="deadbeef")
+    fallback_calls = []
+
+    def fake_run_command(command, cwd, capture_output=False, check=True):
+        assert "-o" in command
+        review_path.write_text("not valid json", encoding="utf-8")
+
+    def fake_run_codex_json_capture(current_config, prompt, *, output_schema_path=None):
+        fallback_calls.append((current_config, prompt, output_schema_path))
+        return """
+{"type":"review_output","review_output":{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"No actionable bugs were identified.","overall_confidence_score":0.82}}
+"""
+
+    monkeypatch.setattr(ralph, "run_command", fake_run_command)
+    monkeypatch.setattr(ralph, "run_codex_json_capture", fake_run_codex_json_capture)
+
+    result = ralph.run_review(config, review_base, review_path)
+
+    assert result.findings == ()
+    assert fallback_calls == [(config, ralph.review_prompt(review_base), schema_path)]
+    assert "patch is correct" in review_path.read_text(encoding="utf-8")
+    assert "retrying via Codex JSON mode" in capsys.readouterr().err
+
+
 def test_commit_with_generated_message_falls_back_to_json_mode_when_output_file_is_missing(tmp_path, monkeypatch):
     ralph = load_ralph_module()
     config = ralph.RalphConfig(
@@ -433,3 +504,39 @@ def test_commit_with_generated_message_falls_back_to_json_mode_when_output_file_
     assert message == "Harden Ralph fallback handling"
     assert commands[0][0:2] == ("codex", "exec")
     assert commands[1][0:2] == ("git", "commit")
+
+
+def test_run_codex_json_capture_prefers_valid_stderr_json_stream(monkeypatch, tmp_path, capsys):
+    ralph = load_ralph_module()
+    config = ralph.RalphConfig(
+        feature_prompt="feature",
+        workdir=tmp_path,
+        codex_bin="codex",
+        model=None,
+        max_rounds=3,
+        max_check_repair_rounds=1,
+        base_ref=None,
+        push_remote="origin",
+        push_enabled=False,
+        review_schema_path=tmp_path / "schema.json",
+        scratch_dir=None,
+        scratch_dir_name="ralph",
+    )
+
+    monkeypatch.setattr(
+        ralph,
+        "run_command",
+        lambda command, cwd, capture_output=False, check=True: CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="captured progress\n",
+            stderr='{"type":"task_complete","last_agent_message":"Recovered from stderr"}\n',
+        ),
+    )
+
+    stream_text = ralph.run_codex_json_capture(config, "prompt")
+
+    assert stream_text == '{"type":"task_complete","last_agent_message":"Recovered from stderr"}\n'
+    captured = capsys.readouterr()
+    assert "captured progress" in captured.out
+    assert captured.err == ""

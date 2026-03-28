@@ -489,6 +489,8 @@ def parse_jsonl_events(stream_text: str) -> Tuple[dict, ...]:
         line = raw_line.strip()
         if not line:
             continue
+        if not line.startswith("{"):
+            continue
         try:
             payload = json.loads(line)
         except json.JSONDecodeError as error:
@@ -499,6 +501,28 @@ def parse_jsonl_events(stream_text: str) -> Tuple[dict, ...]:
     if not events:
         raise RalphError("Codex JSON mode produced no events.")
     return tuple(events)
+
+
+def select_jsonl_stream(stdout: str, stderr: str) -> Tuple[str, str]:
+    candidates = (
+        ("stdout", stdout),
+        ("stderr", stderr),
+    )
+    errors = []
+    for stream_name, stream_text in candidates:
+        if not stream_text.strip():
+            continue
+        try:
+            parse_jsonl_events(stream_text)
+        except RalphError as error:
+            errors.append(f"{stream_name}: {error}")
+            continue
+        return stream_text, stream_name
+
+    if not errors:
+        raise RalphError("Codex JSON mode produced no events.")
+    error_summary = "; ".join(errors)
+    raise RalphError(f"Codex JSON mode did not produce a valid event stream ({error_summary}).")
 
 
 def json_mode_text(value: object, context: str) -> Optional[str]:
@@ -605,9 +629,12 @@ def run_codex_json_capture(config: RalphConfig, prompt: str, *, output_schema_pa
     if completed.returncode != 0:
         emit_captured_output(completed)
         raise RalphError(f"Command failed ({completed.returncode}): {quote_command(command)}")
-    if completed.stderr:
+    json_stream, stream_name = select_jsonl_stream(completed.stdout, completed.stderr)
+    if completed.stdout and stream_name != "stdout":
+        print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
+    if completed.stderr and stream_name != "stderr":
         print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n", file=sys.stderr)
-    return completed.stdout
+    return json_stream
 
 
 def run_check_repair_pass(config: RalphConfig, check_failures_path: Path, task_context: str) -> None:
@@ -696,6 +723,7 @@ def run_initial_implementation(config: RalphConfig) -> None:
 
 
 def run_review(config: RalphConfig, review_base: ReviewBase, review_path: Path) -> ReviewResult:
+    prompt = review_prompt(review_base)
     command = codex_base_command(config)
     command.extend(
         (
@@ -703,18 +731,27 @@ def run_review(config: RalphConfig, review_base: ReviewBase, review_path: Path) 
             str(config.review_schema_path),
             "-o",
             str(review_path),
-            review_prompt(review_base),
+            prompt,
         )
     )
     run_command(command, config.workdir)
 
     review_text = read_text_output(review_path)
+    if review_text is not None:
+        try:
+            return parse_review_result(review_text)
+        except RalphError as error:
+            print(
+                f"Review output file {review_path} was invalid ({error}); retrying via Codex JSON mode.",
+                file=sys.stderr,
+            )
+
     if review_text is None:
-        json_output = run_codex_json_capture(
-            config, review_prompt(review_base), output_schema_path=config.review_schema_path
-        )
-        review_text = recover_review_text_from_jsonl(json_output)
-        review_path.write_text(f"{review_text}\n", encoding="utf-8")
+        print(f"Review output file {review_path} was empty; retrying via Codex JSON mode.", file=sys.stderr)
+
+    json_output = run_codex_json_capture(config, prompt, output_schema_path=config.review_schema_path)
+    review_text = recover_review_text_from_jsonl(json_output)
+    review_path.write_text(f"{review_text}\n", encoding="utf-8")
     return parse_review_result(review_text)
 
 
