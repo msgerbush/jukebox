@@ -11,6 +11,7 @@ from jukebox.settings.errors import (
     UnsupportedSettingsVersionError,
 )
 from jukebox.settings.types import JsonObject, JsonValue
+from jukebox.sonos.discovery import DiscoveredSonosSpeaker
 
 from .commands import SettingsResetCommand, SettingsSetCommand, SettingsShowCommand
 
@@ -49,6 +50,25 @@ def render_cli_error(err: BaseException, verbose: bool = False) -> str:
     if verbose and str(err) and str(err) != message:
         return "{}\n\nDetails: {}".format(message, str(err))
     return message
+
+
+def render_sonos_speakers_output(speakers: list[DiscoveredSonosSpeaker]) -> str:
+    if not speakers:
+        return "No visible Sonos speakers found."
+
+    name_width = max(len(speaker.name) for speaker in speakers)
+    host_width = max(len(speaker.host) for speaker in speakers)
+    return "\n".join(
+        "{index}. {name:<{name_width}}   {host:<{host_width}}   {uid}".format(
+            index=index,
+            name=speaker.name,
+            name_width=name_width,
+            host=speaker.host,
+            host_width=host_width,
+            uid=speaker.uid,
+        )
+        for index, speaker in enumerate(speakers, start=1)
+    )
 
 
 def _render_persisted_settings(payload: JsonObject) -> str:
