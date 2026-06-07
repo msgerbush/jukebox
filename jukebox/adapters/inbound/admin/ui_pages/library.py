@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 
 from fastapi import Request
@@ -274,8 +275,10 @@ class LibraryUIPageBuilder:
         self,
         request: Request,
         poll_interval_seconds: float = 0.5,
+        heartbeat_interval_seconds: float = 15.0,
     ) -> AsyncIterator[bytes]:
         previous_payload: str | None = None
+        last_sent_at = time.monotonic()
 
         while True:
             payload = self.serialize_current_tag_components(
@@ -283,7 +286,11 @@ class LibraryUIPageBuilder:
             )
             if payload != previous_payload:
                 previous_payload = payload
+                last_sent_at = time.monotonic()
                 yield f"data: {payload}\n\n".encode()
+            elif time.monotonic() - last_sent_at >= heartbeat_interval_seconds:
+                last_sent_at = time.monotonic()
+                yield b": keep-alive\n\n"
 
             if await request.is_disconnected():
                 break

@@ -219,6 +219,31 @@ async def test_current_tag_banner_event_stream_emits_serialized_updates():
 
 
 @pytest.mark.skipif(not FASTUI_INSTALLED, reason="FastUI dependencies are not installed")
+@pytest.mark.anyio
+async def test_current_tag_banner_event_stream_emits_keepalive_while_idle():
+    from jukebox.domain.entities import CurrentTagStatus
+
+    page_builder = build_library_page_builder()
+    page_builder.get_current_tag_status.execute.side_effect = [
+        CurrentTagStatus(tag_id="tag-123", known_in_library=False),
+        CurrentTagStatus(tag_id="tag-123", known_in_library=False),
+    ]
+    request = MagicMock()
+    request.is_disconnected = AsyncMock(side_effect=[False])
+
+    stream = page_builder.current_tag_banner_event_stream(
+        request,
+        poll_interval_seconds=0,
+        heartbeat_interval_seconds=0,
+    )
+    first_chunk = await anext(stream)
+    second_chunk = await anext(stream)
+
+    assert first_chunk.decode("utf-8").startswith("data: [")
+    assert second_chunk == b": keep-alive\n\n"
+
+
+@pytest.mark.skipif(not FASTUI_INSTALLED, reason="FastUI dependencies are not installed")
 def test_index_page_shows_remove_toast(walk_components):
     page_builder = build_library_page_builder()
     components = page_builder.build_index_page_components(toast="toast-remove-disc-success")
